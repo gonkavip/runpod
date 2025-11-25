@@ -16,6 +16,8 @@ python llama31.py \
     --tokenizer_path llama-models/models/llama3_1/Meta-Llama-3.1-8B/tokenizer.model
 """
 
+from __future__ import annotations
+
 import os
 import glob
 import fire
