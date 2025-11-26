@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import logging
 from typing import Dict, Any
 
@@ -19,6 +20,9 @@ logger = logging.getLogger(__name__)
 # Global compute instance (loaded once, reused across requests)
 COMPUTE = None
 CURRENT_BLOCK_HASH = None
+
+# Maximum job duration: 7 minutes
+MAX_JOB_DURATION = 7 * 60
 
 
 def initialize_compute(
@@ -58,7 +62,11 @@ def initialize_compute(
 
 def handler(event: Dict[str, Any]):
     """
-    Streaming nonce generator - runs UNLIMITED until client disconnects
+    Streaming nonce generator.
+
+    Stops when:
+    1. Client calls POST /cancel/{job_id}
+    2. Timeout after 7 minutes (MAX_JOB_DURATION)
 
     Input from client (ALL REQUIRED):
     {
@@ -72,15 +80,20 @@ def handler(event: Dict[str, Any]):
         "devices": list
     }
 
-    Yields until disconnect:
+    Yields:
     {
         "nonces": [...],
         "dist": [...],
         "batch_number": int,
         "next_nonce": int,
+        "elapsed_seconds": int,
         ...
     }
     """
+    batch_count = 0
+    total_computed = 0
+    total_valid = 0
+
     try:
         input_data = event.get("input", {})
 
@@ -107,62 +120,63 @@ def handler(event: Dict[str, Any]):
         target = get_target(block_hash, compute.params.vocab_size)
 
         current_nonce = start_nonce
-        batch_count = 0
-        total_computed = 0
-        total_valid = 0
+        start_time = time.time()
 
-        # INFINITE streaming until client disconnects
-        try:
-            while True:
-                nonces = list(range(current_nonce, current_nonce + batch_size))
+        # Streaming until timeout or cancel
+        while True:
+            # Check 7-minute timeout
+            elapsed = time.time() - start_time
+            if elapsed > MAX_JOB_DURATION:
+                logger.info(f"TIMEOUT: {elapsed:.0f}s exceeded {MAX_JOB_DURATION}s limit")
+                logger.info(f"STOPPED: {batch_count} batches, {total_computed} computed, {total_valid} valid")
+                return
 
-                proof_batch = compute(
-                    nonces=nonces,
-                    public_key=public_key,
-                    target=target,
-                )
+            nonces = list(range(current_nonce, current_nonce + batch_size))
 
-                filtered_batch = proof_batch.sub_batch(r_target)
+            proof_batch = compute(
+                nonces=nonces,
+                public_key=public_key,
+                target=target,
+            )
 
-                batch_count += 1
-                total_computed += len(proof_batch)
-                total_valid += len(filtered_batch)
+            filtered_batch = proof_batch.sub_batch(r_target)
 
-                logger.info(f"Batch #{batch_count}: {len(filtered_batch)} valid")
+            batch_count += 1
+            total_computed += len(proof_batch)
+            total_valid += len(filtered_batch)
 
-                # Yield - GeneratorExit raised if client disconnects
-                try:
-                    yield {
-                        "public_key": filtered_batch.public_key,
-                        "block_hash": filtered_batch.block_hash,
-                        "block_height": filtered_batch.block_height,
-                        "nonces": filtered_batch.nonces,
-                        "dist": filtered_batch.dist,
-                        "node_id": filtered_batch.node_id,
-                        "batch_number": batch_count,
-                        "batch_computed": len(proof_batch),
-                        "batch_valid": len(filtered_batch),
-                        "total_computed": total_computed,
-                        "total_valid": total_valid,
-                        "next_nonce": current_nonce + batch_size,
-                    }
-                except GeneratorExit:
-                    logger.info(f"CLIENT DISCONNECTED at batch {batch_count}")
-                    raise
+            logger.info(f"Batch #{batch_count}: {len(filtered_batch)} valid, elapsed={int(elapsed)}s")
 
-                current_nonce += batch_size
+            yield {
+                "public_key": filtered_batch.public_key,
+                "block_hash": filtered_batch.block_hash,
+                "block_height": filtered_batch.block_height,
+                "nonces": filtered_batch.nonces,
+                "dist": filtered_batch.dist,
+                "node_id": filtered_batch.node_id,
+                "batch_number": batch_count,
+                "batch_computed": len(proof_batch),
+                "batch_valid": len(filtered_batch),
+                "total_computed": total_computed,
+                "total_valid": total_valid,
+                "next_nonce": current_nonce + batch_size,
+                "elapsed_seconds": int(elapsed),
+            }
 
-        except GeneratorExit:
-            logger.info(f"STOPPED: {total_computed} computed, {total_valid} valid")
-            return
+            current_nonce += batch_size
 
+    except GeneratorExit:
+        logger.info(f"CANCELLED: {batch_count} batches, {total_computed} computed, {total_valid} valid")
     except Exception as e:
         logger.error(f"ERROR: {str(e)}", exc_info=True)
-        return {
+        yield {
             "error": str(e),
             "error_type": type(e).__name__,
         }
 
 
-# Start serverless handler
-runpod.serverless.start({"handler": handler})
+# Start serverless handler with streaming support
+runpod.serverless.start({
+    "handler": handler,
+    "return_aggregate_stream": True,
+})
