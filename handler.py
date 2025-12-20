@@ -16,7 +16,13 @@ from pow.compute.autobs_v2 import get_batch_size_for_gpu_group
 from pow.compute.worker import ParallelWorkerManager, PooledWorkerManager
 from pow.compute.model_init import ModelWrapper
 from pow.compute.orchestrator_client import OrchestratorClient
-from pow.models.utils import Params
+from pow.compute.gpu_arch import (
+    get_gpu_architecture,
+    get_architecture_config,
+    GPUArchitecture,
+    should_use_fallback_mode,
+)
+from pow.models.utils import Params, get_params_with_fp8
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -248,10 +254,36 @@ def generation_handler(
 
         params = Params(**params_dict)
 
-        # Auto-detect GPUs and create groups
+        # Auto-detect GPUs and architecture
         import torch
         gpu_count = torch.cuda.device_count()
         logger.info(f"Detected {gpu_count} GPUs")
+
+        # Detect GPU architecture for optimizations
+        try:
+            gpu_caps = get_gpu_architecture(0)
+            arch_config = get_architecture_config(0)
+            logger.info(
+                f"GPU Architecture: {gpu_caps.device_name} "
+                f"({gpu_caps.architecture.value}, SM{gpu_caps.compute_capability[0]}{gpu_caps.compute_capability[1]})"
+            )
+            logger.info(
+                f"  Memory: {gpu_caps.total_memory_gb:.1f}GB, "
+                f"FP8: {gpu_caps.supports_fp8}, BF16: {gpu_caps.supports_bfloat16}"
+            )
+
+            # Enable FP8 for Blackwell GPUs
+            use_fp8 = arch_config.get("use_fp8", False)
+            if use_fp8 and gpu_caps.architecture == GPUArchitecture.BLACKWELL:
+                logger.info("Blackwell GPU detected - enabling FP8 optimizations")
+                params = get_params_with_fp8(params, enable_fp8=True)
+
+            # Check for fallback mode
+            if should_use_fallback_mode():
+                logger.warning("Fallback mode enabled - using conservative settings")
+
+        except Exception as e:
+            logger.warning(f"Could not detect GPU architecture: {e}, using defaults")
 
         # Create GPU groups based on VRAM requirements
         gpu_groups = create_gpu_groups(params=params)

@@ -6,6 +6,18 @@ import math
 
 logger = create_logger(__name__)
 
+# Lazy import to avoid circular dependency
+_gpu_arch_module = None
+
+
+def _get_architecture_config(device_id: int = 0):
+    """Lazy import of gpu_arch module to get architecture config."""
+    global _gpu_arch_module
+    if _gpu_arch_module is None:
+        from pow.compute import gpu_arch
+        _gpu_arch_module = gpu_arch
+    return _gpu_arch_module.get_architecture_config(device_id)
+
 
 def get_batch_size_for_gpu_group(gpu_group: GpuGroup, params: Params, target_memory_usage: float = 0.9) -> int:
     if params == PARAMS_V1:
@@ -21,9 +33,39 @@ def get_batch_size_for_gpu_group(gpu_group: GpuGroup, params: Params, target_mem
 
 
 def estimate_batch_size(gpu_group: GpuGroup, params: Params, target_memory_usage: float = 0.9) -> int:
+    """
+    Estimate optimal batch size based on GPU memory and architecture.
+
+    For Blackwell GPUs (B200), uses optimized parameters:
+    - Higher target memory usage (0.95 vs 0.90) due to TMEM
+    - Lower activation overhead factor (6.0 vs 8.0) for 5th gen tensor cores
+
+    Args:
+        gpu_group: GPU group to estimate batch size for
+        params: Model parameters
+        target_memory_usage: Target fraction of free memory to use
+
+    Returns:
+        Estimated batch size that fits in GPU memory
+    """
     # --- 1. Define Constants and Assumptions ---
-    BYTES_PER_ELEMENT = 2  # float16
-    ACTIVATION_OVERHEAD_FACTOR = 8.0
+    BYTES_PER_ELEMENT = 2  # float16/bfloat16
+
+    # Get architecture-specific settings
+    try:
+        arch_config = _get_architecture_config(gpu_group.primary_device)
+        ACTIVATION_OVERHEAD_FACTOR = arch_config.get("activation_overhead_factor", 8.0)
+        target_memory_usage = arch_config.get("target_memory_usage", target_memory_usage)
+        batch_multiplier = arch_config.get("batch_size_multiplier", 1.0)
+        logger.debug(
+            f"Using architecture config: activation_factor={ACTIVATION_OVERHEAD_FACTOR}, "
+            f"target_mem={target_memory_usage}, batch_mult={batch_multiplier}"
+        )
+    except Exception as e:
+        logger.debug(f"Could not get architecture config: {e}, using defaults")
+        ACTIVATION_OVERHEAD_FACTOR = 8.0
+        batch_multiplier = 1.0
+
     SAFETY_MARGIN = 0.90
     num_gpus = gpu_group.group_size
 
@@ -90,4 +132,8 @@ def estimate_batch_size(gpu_group: GpuGroup, params: Params, target_memory_usage
     # --- 5. Determine Final Batch Size based on the Bottleneck ---
     estimated_bs = math.floor(bottleneck_memory_mb / memory_per_batch_item_mb)
 
-    return max(1, int(estimated_bs))
+    # Apply architecture-specific batch size multiplier
+    # Blackwell GPUs can handle larger batches more efficiently
+    final_bs = int(estimated_bs * batch_multiplier)
+
+    return max(1, final_bs)
